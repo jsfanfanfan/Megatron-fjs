@@ -1,3 +1,5 @@
+# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+
 """Utility functions used throughout Megatron core"""
 import array
 import hashlib
@@ -23,12 +25,10 @@ from packaging.version import Version as PkgVersion
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedTensor
 
+logger = logging.getLogger(__name__)
 
 
-
-
-
-
+_te_version = None
 
 
 def get_te_version():
@@ -55,15 +55,595 @@ def is_te_min_version(version, check_equality=True):
     return get_te_version() > PkgVersion(version)
 
 
+def ensure_divisibility(numerator, denominator):
+    """Ensure that numerator is divisible by the denominator."""
+    assert numerator % denominator == 0, "{} is not divisible by {}".format(numerator, denominator)
+
+
+def divide(numerator, denominator):
+    """Ensure that numerator is divisible by the denominator and return
+    the division value."""
+    ensure_divisibility(numerator, denominator)
+    return numerator // denominator
+
+
+def get_attr_wrapped_model(model, attr, allow_none=True, return_model_obj=False):
+    """Get an attribute from a wrapped model.
+    If return_model_obj is true, return the object that has the 'attr' attribute;
+    otherwise, return the attribute directly."""
+    if isinstance(model, list):
+        raise RuntimeError("_get_attr_wrapped_model given a list of models")
+
+    if allow_none:
+
+        def condition(model, attr):
+            return not hasattr(model, attr)
+
+    else:
+
+        def condition(model, attr):
+            return getattr(model, attr, None) is None
+
+    while condition(model, attr):
+        if not hasattr(model, "module"):
+            raise RuntimeError(f"_get_attr_wrapped_model couldn't find attribute {attr}")
+
+        model = model.module
+
+    if return_model_obj:
+        return model
+    return getattr(model, attr)
+
+
+def get_model_type(model):
+    """Returns model_type attribute"""
+    return get_attr_wrapped_model(model, 'model_type')
+
+
+def get_model_xattn(model):
+    """Returns whether the model has the xattn_needed attribute"""
+    try:
+        return get_attr_wrapped_model(model, 'xattn_needed')
+    except RuntimeError:
+        return False
+
+
+def get_model_config(model):
+    """Returns the config attribute, allowed to return None"""
+    return get_attr_wrapped_model(model, 'config', allow_none=False)
+
+
+class GlobalMemoryBuffer:
+    """Global buffer to avoid dynamic memory allocations.
+    Caller should ensure that buffers of the same name
+    are not used concurrently."""
+
+    def __init__(self):
+        self.buffer = {}
+
+    def get_tensor(self, tensor_shape, dtype, name):
+        """
+        Returns (potentially) a sub-tensor from the self.buffer for the given shape.
+        """
+        required_len = reduce(operator.mul, tensor_shape, 1)
+        if (
+            self.buffer.get((name, dtype), None) is None
+            or self.buffer[(name, dtype)].numel() < required_len
+        ):
+            self.buffer[(name, dtype)] = torch.empty(
+                required_len, dtype=dtype, device=torch.cuda.current_device(), requires_grad=False
+            )
+
+        return self.buffer[(name, dtype)][0:required_len].view(*tensor_shape)
+
+
+def _kernel_make_viewless_tensor(inp, requires_grad):
+    """Make a viewless tensor.
+
+    View tensors have the undesirable side-affect of retaining a reference
+    to the originally-viewed tensor, even after manually setting the '.data'
+    field. This method creates a new tensor that links to the old tensor's
+    data, without linking the viewed tensor, referenced via the '._base'
+    field.
+    """
+    out = torch.empty((1,), dtype=inp.dtype, device=inp.device, requires_grad=requires_grad)
+    out.data = inp.data
+    return out
+
+
+class MakeViewlessTensor(torch.autograd.Function):
+    """
+    Autograd function to make a viewless tensor.
+
+    This function should be used in cases where the computation graph needs
+    to be propagated, but we only want a viewless tensor (e.g.,
+    ParallelTransformer's hidden_states). Call this function by passing
+    'keep_graph = True' to 'make_viewless_tensor()'.
+    """
+
+    @staticmethod
+    def forward(ctx, inp, requires_grad):
+        """Runs the fwd pass of _kernel_make_viewless_tensor"""
+        return _kernel_make_viewless_tensor(inp, requires_grad)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """No-op"""
+        return grad_output, None
+
+
+def make_viewless_tensor(inp, requires_grad, keep_graph):
+    """
+    Entry-point for creating viewless tensors.
+
+    This method should be used, rather than calling 'MakeViewlessTensor'
+    or '_kernel_make_viewless_tensor' directly. This method acts as a
+    switch for determining if an autograd function or a regular method
+    should be used to create the tensor.
+    """
+
+    # return tensor as-is, if not a 'view'
+    if inp._base is None:
+        return inp
+
+    # create viewless tensor
+    if keep_graph:
+        return MakeViewlessTensor.apply(inp, requires_grad)
+    else:
+        return _kernel_make_viewless_tensor(inp, requires_grad)
+
+
+def assert_viewless_tensor(tensor, extra_msg=None):
+    """Assert that a tensor is not a view (i.e., its '._base' field is
+    not set)."""
+    if isinstance(tensor, list):
+        [assert_viewless_tensor(t) for t in tensor]
+        return tensor
+    if not isinstance(tensor, torch.Tensor):
+        return tensor
+    assert tensor._base is None, (
+        "Ensure tensor._base is None before setting tensor.data or storing "
+        "tensor to memory buffer. Otherwise, a memory leak will occur (and "
+        "likely accumulate over iterations). %s"
+    ) % extra_msg
+    return tensor
+
+
+def safely_set_viewless_tensor_data(tensor, new_data_tensor):
+    """Safely set tensor's '.data' field.
+
+    Check first that the tensor is viewless (i.e., '._base' not set). If not,
+    raise an exception.
+    """
+    assert_viewless_tensor(
+        tensor,
+        extra_msg="FYI, tensor._base has shape %s, and new_data_tensor has shape %s."
+        % ("--" if tensor._base is None else tensor._base.shape, new_data_tensor.shape),
+    )
+    tensor.data = new_data_tensor
+
+
+def init_method_normal(sigma):
+    """Init method based on N(0, sigma)."""
+
+    def init_(tensor):
+        return torch.nn.init.normal_(tensor, mean=0.0, std=sigma)
+
+    return init_
+
+
+def scaled_init_method_normal(sigma, num_layers):
+    """Init method based on N(0, sigma/sqrt(2*num_layers)."""
+    std = sigma / math.sqrt(2.0 * num_layers)
+
+    def init_(tensor):
+        return torch.nn.init.normal_(tensor, mean=0.0, std=std)
+
+    return init_
+
+
+def log_single_rank(logger: logging.Logger, *args: Any, rank: int = 0, **kwargs: Any):
+    """If torch distributed is initialized, log only on rank
+
+    Args:
+        logger (logging.Logger): The logger to write the logs
+
+        args (Tuple[Any]): All logging.Logger.log positional arguments
+
+        rank (int, optional): The rank to write on. Defaults to 0.
+
+        kwargs (Dict[str, Any]): All logging.Logger.log keyword arguments
+    """
+    if torch.distributed.is_initialized():
+        if torch.distributed.get_rank() == rank:
+            logger.log(*args, **kwargs)
+    else:
+        logger.log(*args, **kwargs)
+
+
+def log_on_each_pipeline_stage(logger: logging.Logger, *args: Any, **kwargs: Any):
+    """Log on first rank in each pipeline stage
+
+    Args:
+        logger (logging.Logger): The logger to write the logs
+
+        args (Tuple[Any]): All logging.Logger.log positional arguments
+
+        kwargs (Dict[str, Any]): All logging.Logger.log keyword arguments
+    """
+    assert torch.distributed.is_initialized()
+
+    if (
+        parallel_state.get_data_parallel_rank(with_context_parallel=True) == 0
+        and parallel_state.get_tensor_model_parallel_rank() == 0
+    ):
+        logger.log(*args, **kwargs)
+
+
+def check_param_hashes_across_dp_replicas(
+    model: List[torch.nn.Module], cross_check: bool = False
+) -> bool:
+    """Computes hashes of all parameters in model, all-gathers hashes across DP replicas,
+    and then checks for equality between the locally-computed hashes and those of other ranks.
+
+    NOTE: This function computes SHA-1 hashes on the CPU and thus needs to move all param
+    tensors from GPU to CPU first; as a result, this function is not intended to be called
+    very frequently in the main training loop.
+
+    Args:
+        model (List[torch.nn.Module]): List of model chunks whose parameter hashes need to
+            be checked.
+        cross_check (bool): If true, will check whether hashes match across all DP replicas.
+
+    Returns:
+        True if all param hashes match with corresponding hash on DP replica 0 or
+        across all replicas if cross_check is enabled, False otherwise.
+    """
+
+    # Compute per-parameter hashes on this rank.
+    params = []
+    local_param_hashes = []
+    for model_chunk_id, model_chunk in enumerate(model):
+        for param_name, param in model_chunk.named_parameters():
+            param_hash = torch.frombuffer(
+                array.array(
+                    'B', hashlib.sha1(param.data.to("cpu").float().numpy(force=True)).digest()
+                ),
+                dtype=torch.uint8,
+            )
+            params.append((model_chunk_id, param_name, param))
+            local_param_hashes.append(param_hash)
+    local_param_hashes = torch.stack(local_param_hashes)
+
+    # Collect per-parameter hashes across all ranks in DP group.
+    all_param_hashes = [
+        torch.zeros_like(local_param_hashes)
+        for _ in range(parallel_state.get_data_parallel_world_size())
+    ]
+    torch.distributed.all_gather(
+        all_param_hashes, local_param_hashes, group=parallel_state.get_data_parallel_group_gloo()
+    )
+
+    # Make sure local per-parameter hash matches DP rank 0.
+    param_hashes_match = torch.equal(local_param_hashes, all_param_hashes[0])
+    if not param_hashes_match:
+        for i, (model_chunk_id, param_name, param) in enumerate(params):
+            if not torch.equal(local_param_hashes[i], all_param_hashes[0][i]):
+                rank = torch.distributed.get_rank()
+                logger.info(
+                    f"[Rank {rank}] Hash not matching for {param_name} in model chunk"
+                    f"{model_chunk_id}"
+                )
+    if cross_check:
+        # Make sure all ranks have the same hash.
+        return all(map(lambda x: torch.equal(local_param_hashes, x), all_param_hashes))
+    else:
+        return param_hashes_match
+
+
+def make_tp_sharded_tensor_for_checkpoint(
+    tensor, key, tp_axis=0, replica_id=None, prepend_offsets=(), **kwargs
+):
+    """Helper for instantiating a ShardedTensor where the `tp_axis` dimension
+    is sharded across TP group.
+
+    Optionally, can provide offsets which prepend new dimensions to the tensor.
+    """
+
+    prepend_axis_num = len(prepend_offsets)
+
+    if replica_id is None:
+        replica_id = (0, 0, parallel_state.get_data_parallel_rank(with_context_parallel=True))
+
+    return ShardedTensor.from_rank_offsets(
+        key,
+        tensor,
+        *prepend_offsets,
+        (
+            tp_axis + prepend_axis_num,
+            parallel_state.get_tensor_model_parallel_rank(),
+            parallel_state.get_tensor_model_parallel_world_size(),
+        ),
+        replica_id=replica_id,
+        prepend_axis_num=prepend_axis_num,
+        **kwargs,
+    )
+
+
+def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_id=None, **kwargs):
+    """Helper for instantiating a non-sharded ShardedTensor (replicated across TP and DP group).
+
+    Optionally, can provide offsets which prepend new dimensions to the tensor.
+    """
+
+    prepend_axis_num = len(prepend_offsets)
+
+    if replica_id is None:
+        replica_id = (
+            0,
+            parallel_state.get_tensor_model_parallel_rank(),
+            parallel_state.get_data_parallel_rank(with_context_parallel=True),
+        )
+
+    return ShardedTensor.from_rank_offsets(
+        key,
+        tensor,
+        *prepend_offsets,
+        replica_id=replica_id,
+        prepend_axis_num=prepend_axis_num,
+        **kwargs,
+    )
+
+
+def prepare_input_tensors_for_wgrad_compute(grad_output, all_gathered_input):
+    """Ensure grad_output is stored in a contiguous buffer."""
+    # Doing gather + slicing during the NeMo forward pass can make this tensor
+    # not be contiguous. PyTorch only checks if the tensor is contiguous, and only
+    # clones it if it's not contiguous:
+    # https://github.com/pytorch/pytorch/blob/c47cf9bc7f9e02f649ab4ed53fe4d35732c92ab6/torch/_refs/__init__.py#L2761
+    grad_output = grad_output.contiguous()
+    # Convert the tensor shapes to 2D for execution compatibility
+    if grad_output.dim() == 3:
+        grad_output = grad_output.view(
+            grad_output.shape[0] * grad_output.shape[1], grad_output.shape[2]
+        )
+        all_gathered_input = all_gathered_input.view(
+            all_gathered_input.shape[0] * all_gathered_input.shape[1], all_gathered_input.shape[2]
+        )
+
+    return grad_output, all_gathered_input
+
+
+def drain_embedding_wgrad_compute(config, embedding_activation_buffer, grad_output_buffer, weight):
+    """Helper for performing embedding wgrad GEMM's during the pipeline drain phase, pipelines the
+    AllGather and GEMM's.
+
+    Should only be used when pipeline model parallelism and gradient accumulation
+    fusion are enabled.
+    """
+
+    assert len(embedding_activation_buffer) == len(
+        grad_output_buffer
+    ), "Length of activation and gradient buffers need to be equal!"
+
+    import fused_weight_gradient_mlp_cuda
+
+    from megatron.core.parallel_state import (
+        get_global_memory_buffer,
+        get_tensor_model_parallel_group,
+        get_tensor_model_parallel_world_size,
+    )
+
+    input = embedding_activation_buffer.pop(0)
+    world_size = get_tensor_model_parallel_world_size()
+    dim_size = list(input.size())
+    dim_size[0] = dim_size[0] * world_size
+
+    all_gathered_input = [None, None]
+    if config.sequence_parallel:
+        all_gather_buffer = get_global_memory_buffer().get_tensor(dim_size, input.dtype, "mpu_0")
+        handle = torch.distributed._all_gather_base(
+            all_gather_buffer, input, group=get_tensor_model_parallel_group(), async_op=False
+        )
+
+        all_gathered_input[0] = all_gather_buffer
+        all_gather_buffer = None
+    else:
+        all_gathered_input[0] = input
+
+    input = None
+
+    def wgrad_compute(all_gathered_input, grad_output, weight):
+
+        grad_output, all_gathered_input = prepare_input_tensors_for_wgrad_compute(
+            grad_output, all_gathered_input
+        )
+
+        if config.gradient_accumulation_fusion:
+            if weight.main_grad.dtype == torch.float32:
+                fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp32(
+                    all_gathered_input, grad_output, weight.main_grad
+                )
+            elif weight.main_grad.dtype in (torch.float16, torch.bfloat16):
+                fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp16(
+                    all_gathered_input, grad_output, weight.main_grad
+                )
+            else:
+                raise RuntimeError("Unsupported gradient type for gradient accumulation fusion")
+
+    # We have all_gathered_input list acting as a double buffer here,
+    # since we are pipelining the AllGather and GEMM,one buffer all gathers
+    # the input while the other buffer reads from it for the GEMM. We use i
+    # and (i+1) for indexing to enable this double buffering.
+    for i in range(len(embedding_activation_buffer)):
+        input = embedding_activation_buffer.pop(0)
+        if config.sequence_parallel:
+            name = "mpu_" + str((i + 1) % 2)
+            all_gather_buffer = get_global_memory_buffer().get_tensor(dim_size, input.dtype, name)
+            handle = torch.distributed._all_gather_base(
+                all_gather_buffer, input, group=get_tensor_model_parallel_group(), async_op=True
+            )
+
+            all_gathered_input[(i + 1) % 2] = all_gather_buffer
+            all_gather_buffer = None
+        else:
+            all_gathered_input[(i + 1) % 2] = input
+
+        grad_output = grad_output_buffer.pop(0)
+        wgrad_compute(all_gathered_input[i % 2], grad_output, weight)
+        drain_idx = (i + 1) % 2
+        input, all_gathered_input[i % 2], grad_output = None, None, None
+
+        if config.sequence_parallel:
+            handle.wait()
+
+    grad_output = grad_output_buffer.pop(0)
+    wgrad_compute(all_gathered_input[drain_idx], grad_output, weight)
+    input, all_gathered_input[drain_idx], grad_output = None, None, None
+
+
+def local_multi_tensor_applier(op, noop_flag_buffer, tensor_lists, *args):
+    """Multi tensor op applier"""
+    return op(2048 * 32, noop_flag_buffer, tensor_lists, *args)
+
+
+# computes l2 norm for a list of contiguous tensors
+# works as a drop-in replacement for amp_C.multi_tensor_l2norm
+def local_multi_tensor_l2_norm(chunk_size, noop_flag, tensor_lists, per_tensor, *args):
+    """
+    Computes l2 norm for a list of contiguous tensors
+    works as a drop-in replacement for amp_C.multi_tensor_l2norm
+    """
+    l2 = [[(torch.norm(tensor)) for tensor in tensor_list] for tensor_list in tensor_lists]
+    l2_reduced = torch.norm(torch.tensor(l2))
+    l2_cuda = torch.tensor([float(l2_reduced)], dtype=torch.float, device='cuda')
+    return l2_cuda, None
+
+
+# works as a drop-in replacement for amp_C.multi_tensor_scale
+def local_multi_tensor_scale(chunk_size, noop_flag, tensor_lists, scale):
+    """Works as a drop-in replacement for amp_C.multi_tensor_scale."""
+    inputs, targets = tensor_lists[0], tensor_lists[1]
+    if inputs == targets:
+        for i in range(len(targets)):
+            # for parity with apex implementation
+            targets[i] *= scale
+    else:
+        for i in range(len(targets)):
+            targets[i] = inputs[i] * scale
+
+
+class _ValueWithRank:
+    """This is an internal class, not for use outside this module
+
+    Attributes:
+        _rank (int): rank for the value
+        _value (float) : the value it stores, eg elapsed time
+        _unit (str) : unit for the value
+    """
+
+    def __init__(self, value: float, rank: int, unit: str = "") -> None:
+        """Initializer
+
+        Args:
+            _value (float): the initial value with which it is inited
+            _rank (int): the rank number
+            _unit (str) : the unit of the value, eg ms or flops
+        """
+        self._rank = rank
+        self._value = value
+        self._unit = unit
+
+    def __lt__(self, other) -> bool:
+        """Check if value of self is smaller than other's value
+
+        Args:
+            other (_ValueWithRank): The other object to compare with
+
+        Returns:
+            bool: True if lhs._value of operand is less than rhs._value, else False
+        """
+        return self._value < other._value
+
+    def __gt__(self, other) -> bool:
+        """Check if value of self is larger than other's value
+
+        Args:
+            other (_ValueWithRank): The other object to compare with
+
+        Returns:
+            bool: True if lhs._value of operand is greater than rhs._value, else False
+        """
+        return self._value > other._value
+
+    def __call__(self) -> Tuple[float, int, str]:
+        """Returns the value, the rank, and unit as a Tuple
+
+        Returns:
+            Tuple[float, int, str]: value, rank, unit
+        """
+        return self._value, self._rank, self._unit
+
+    def __str__(self) -> str:
+        """String representation of the object
+
+        Returns:
+            str: strigified object
+        """
+
+        return f"{self._value:.2f}{self._unit}/{self._rank}"
+
+
+@dataclass
+class _StragglerData:
+    """This is an internal dataclass, not for use outside this module
+
+    Attributes:
+        min_elapsed (_ValueWithRank) min iteration time across all ranks
+        max_elapsed (_ValueWithRank) max iteration time across all ranks
+        min_btime (_ValueWithRank) min cpu time across all ranks
+        max_btime (_ValueWithRank) max cpu time across all ranks
+        min_temp (_ValueWithRank): min gpu temp across all ranks
+        max_temp (_ValueWithRank): max gpu temp across all ranks
+        min_power (_ValueWithRank) min gpu power across all ranks
+        max_power (_ValueWithRank) max gpu power across all ranks
+        min_util (_ValueWithRank): min gpu util across all ranks
+        max_util (_ValueWithRank): max gpu util across all ranks
+        min_clock (_ValueWithRank): min gpu clock across all ranks
+        max_clock (_ValueWithRank) max gpu clock across all ranks
+        aflops (List[_ValueWithRank]): sorted array of (_ValueWithRank)
+    """
+
+    # gemm time
+    min_elapsed = _ValueWithRank(sys.float_info.max, 0, "ms")
+    max_elapsed = _ValueWithRank(sys.float_info.min, 0, "ms")
+    # get_batch time
+    min_btime = _ValueWithRank(sys.float_info.max, 0, "us")
+    max_btime = _ValueWithRank(sys.float_info.min, 0, "us")
+    # temp
+    min_temp = _ValueWithRank(sys.float_info.max, 0, "C")
+    max_temp = _ValueWithRank(sys.float_info.min, 0, "C")
+    # power
+    min_power = _ValueWithRank(sys.float_info.max, 0, "W")
+    max_power = _ValueWithRank(sys.float_info.min, 0, "W")
+    # util
+    min_util = _ValueWithRank(sys.float_info.max, 0, "%")
+    max_util = _ValueWithRank(sys.float_info.min, 0, "%")
+    # clock
+    min_clock = _ValueWithRank(sys.float_info.max, 0, "MHz")
+    max_clock = _ValueWithRank(sys.float_info.min, 0, "MHz")
+    aflops: Union[List[_ValueWithRank], None] = None
+
+
 class StragglerDetector:
     """Singleton Class implementing per rank Straggler Detector
 
-    它使用 CUDA 事件（cuda events）来对选定的操作进行计时，
-    使用 start 和 stop 方法，这些方法可以直接通过类实例调用，
-    也可以像 Python 上下文管理器一样使用。在收集完数据后，
-    可以使用 report() 方法显示收集到的指标。
-    此功能仅在 CUDA 可用的情况下支持。
-    更多信息请参见 megatron/core/README_STRAGGLER.md
+    It use cuda events to time operation of choice using the
+    start and stop methods which can be directly invoked using
+    the class instance or can be used like a python context.
+    After collection, a report() method is available to display
+    the collected metrics. It is only supported if CUDA is
+    available. megatron/core/README_STRAGGLER.md for more info
 
     Note:
         The instance and class attributes mentioned below are all
@@ -709,3 +1289,19 @@ class StragglerDetector:
 __straggler__ = StragglerDetector()
 """StragglerDetector: private module variable, not be directly accessed
 """
+
+
+# Check if Transformer Engine has Float8Tensor class
+HAVE_TE_FLOAT8TENSOR = False
+try:
+    from transformer_engine.pytorch.float8_tensor import Float8Tensor
+
+    HAVE_TE_FLOAT8TENSOR = True
+except (ImportError, ModuleNotFoundError):
+    # Float8Tensor not found
+    pass
+
+
+def is_float8tensor(tensor: torch.Tensor) -> bool:
+    """Check if a tensor is a Transformer Engine Float8Tensor"""
+    return HAVE_TE_FLOAT8TENSOR and isinstance(tensor, Float8Tensor)

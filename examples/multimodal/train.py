@@ -195,7 +195,7 @@ def forward_step(data_iterator, model: LLaVAModel):
     输入数据迭代器和模型
     返回输出张量和特定 loss mask 的 loss_func
     """
-    time = get_timers()
+    timers = get_timers()
 
     timers('batch-generator', log_level=2).start()
     tokens, labels, loss_mask, attention_mask, position_ids, images, num_image_titles = get_batch(data_iterator)
