@@ -88,13 +88,13 @@ def destroy_global_state():
 
 
 def print_datetime(string):
-    """Note that this call will sync across all ranks."""
+    """将会同步所有 ranks."""
     torch.distributed.barrier()
     time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     print_rank_0('[' + string + '] datetime: {} '.format(time_str))
 
 
-# 通过batchsize计算浮点操作的数量
+# 通过 batchsize 计算浮点操作的数量
 def num_floating_point_operations(args, batch_size):
     # Attention projection size.
     query_projection_size = args.kv_channels * args.num_attention_heads
@@ -157,7 +157,7 @@ def get_start_time_from_progress_log():
     同时返回上次保存的检查点中完成的浮点运算次数。
     """
     args = get_args()
-    assert args.save is not None
+    assert args.save is not None, "save path is missed!!!"
     progress_log_filename = os.path.join(args.save, "progress.txt")
 
     # start_time 是具有相同 world size 的作业开始的时间。
@@ -201,26 +201,26 @@ def pretrain(
         model_provider,
         model_type,
         forward_step_func,
-        process_non_loss_data_func=None,
-        extra_args_provider=None,
-        args_default={},
+        process_non_loss_data_func=None, # 传递了 write_online_eval_to_tensorboard 函数
+        extra_args_provider=None, # 传递了 add_multimodal_extra_args 函数
+        args_default={}, # 传递了 tokenizer 的 type
         get_embedding_ranks=None,
         get_position_embedding_ranks=None,
-        non_loss_data_func=None,
+        non_loss_data_func=None, # # 传递了 run_online_eval 函数
 ):
     """主训练程序
     
     这个函数将按照以下顺序执行
-        1）初始化Megatron
-        2）使用 model_provider 建立模型，优化器，学习率调度器
-        3）调用 train_valid_test_dataset_provier 获取数据集
-        4）使用 forward_step_func 训练模型
+        1)初始化Megatron
+        2)使用 model_provider 建立模型，优化器，学习率调度器
+        3)调用 train_valid_test_dataset_provier 获取数据集
+        4)使用 forward_step_func 训练模型
         
         参数：
             train_valid_test_dataset_provider: 一个函数，它接受训练、验证和测试数据集的大小，
                 并返回 train、valid、test 数据集。
             model_provider: 一个函数，它返回模型的基础版本。
-                这里的基础版本指的是一个简单的 CPU 模型，没有使用 FP16（半精度）或 DDP（分布式数据并行）。
+                这里的基础版本指的是一个简单的 CPU 模型，没有使用 FP16(半精度)或 DDP(分布式数据并行）。
             model_type: 一个枚举值，用于指定正在训练的模型的类型。
             forward_step_func: 一个函数，它接受 数据迭代器 和 模型，
                 并返回一个包含 损失 标量和字典的结果，其中字典的键值对是训练过程中
@@ -231,7 +231,7 @@ def pretrain(
                 它可以用于将输出张量（如图像）写入 TensorBoard。
                 该函数接受 收集的数据（张量列表）、当前迭代索引 和 TensorBoard writer 作为参数。
 
-            extra_args_provider: 一个函数，接受一个解析器（parser）并向其中添加参数。
+            extra_args_provider: 一个函数,接受一个解析器(parser)并向其中添加参数。
                 用于为程序添加自定义参数。
             args_defaults: 一个字典，用于将参数名称映射到默认值。
                 用于设置已经解析过的参数的默认值。

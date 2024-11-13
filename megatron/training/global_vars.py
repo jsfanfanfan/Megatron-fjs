@@ -79,7 +79,7 @@ def set_global_variables(args, build_tokenizer=True):
     assert args is not None
 
     _ensure_var_is_not_initialized(_GLOBAL_ARGS, 'args')
-    set_args(args)
+    set_args(args) # 给 _GLOBAL_ARGS 赋值
 
     init_num_microbatches_calculator(
         args.rank,

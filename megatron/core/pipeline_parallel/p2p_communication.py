@@ -240,24 +240,24 @@ def _communicate(
     config: ModelParallelConfig,
     wait_on_reqs: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Communicate tensors between stages. Used as helper method in other
+    """在流水级之间进行张量通信. Used as helper method in other
     communication methods that are used in megatron/schedules.py.
 
     Args:
         tensor_send_next (torch.Tensor, optional):
-            Tensor to send to next rank (no tensor sent if None)
+            发送给下一个 rank 的张量 (no tensor sent if None)
 
         tensor_send_prev (torch.Tensor, optional):
-            Tensor to send to prev rank (no tensor sent if None)
+            发送给上一个 rank 的张量 (no tensor sent if None)
 
         recv_prev (boolean, required):
-            whether tensor should be received from previous rank.
+            是否从上一个 rank 接收张量.
 
         recv_next (boolean, required):
-            whether tensor should be received from next rank.
+            是否从下一个 rank 接收张量.
 
         tensor_shape (List[int] or torch.Size, required):
-            shape of tensor to receive (this method assumes that all
+            接收张量的形状 (this method assumes that all
             tensors sent and received in a single function call are
             the same shape).
 
@@ -498,7 +498,7 @@ def send_backward(input_tensor_grad: torch.Tensor, config: ModelParallelConfig) 
 def send_forward_recv_backward(
     output_tensor: torch.Tensor, tensor_shape: Shape, config: ModelParallelConfig
 ) -> torch.Tensor:
-    """Batched send and recv with next rank in pipeline.
+    """批量给流水线中的下一个 rank 进行 send and recv.
 
     See _communicate for argument details.
     """

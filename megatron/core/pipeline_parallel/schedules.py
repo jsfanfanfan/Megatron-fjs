@@ -127,7 +127,7 @@ def deallocate_output_tensor(out, deallocate_pipeline_outputs=False):
 
 def custom_backward(output, grad_output):
     '''Directly call C++ autograd engine.
-
+    # 被 364 行调用
     To make the 'deallocate_output_tensor' (above) optimization work, the C++
     autograd engine must be called directly, bypassing Pytorch's
     torch.autograd.backward. Pytorch's 'backward' checks that the output and
@@ -329,10 +329,10 @@ def forward_step(
 def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config):
     """Backward step through passed-in output tensor.
 
-    If last stage, output_tensor_grad is None, otherwise gradient of loss
-    with respect to stage's output tensor.
+    如果是最后一个流水级, output_tensor_grad is None, 否则是 loss 关于
+    流水级输出的梯度.
 
-    Returns gradient of loss with respect to input tensor (None if first
+    返回 loss 关于输入张量的梯度 (None if first
     stage)."""
 
     # NOTE: This code currently can handle at most one skip connection. It
@@ -360,8 +360,8 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
     if output_tensor_grad[0] is None and config.grad_scale_func is not None:
         output_tensor[0] = config.grad_scale_func(output_tensor[0])
 
-    if config.deallocate_pipeline_outputs:
-        custom_backward(output_tensor[0], output_tensor_grad[0])
+    if config.deallocate_pipeline_outputs: # 看看这个参数关了怎么样？
+        custom_backward(output_tensor[0], output_tensor_grad[0]) # 调用 128 行
     else:
         torch.autograd.backward(output_tensor[0], grad_tensors=output_tensor_grad[0])
 
@@ -1168,13 +1168,13 @@ def get_tensor_shapes(
     config,
     encoder_decoder_xattn: bool,
 ):
-    # Determine right tensor sizes (based on position of rank with
-    # respect to split rank) and model size.
-    # Send two tensors if model decoder requires the encoder's output
+    # 确定正确的张量形状 (基于 rank 关于
+    # split rank 的位置) and 模型大小.
+    # 如果模型 decoder 需要 encoder 的输出，发送两个张量
     # (via cross-attention) and rank is in decoder stage.
     #     first tensor is decoder.
     #     second tensor is encoder.
-    # If model has an encoder & decoder and rank is at the boundary:
+    # 如果模型有 encoder & decoder 并且 rank 在边界上:
     #     send one tensor.
     # Otherwise, send one tensor.
     tensor_shapes = []
@@ -1208,7 +1208,7 @@ def recv_forward(tensor_shapes, config):
     for tensor_shape in tensor_shapes:
         if tensor_shape is None:
             input_tensors.append(None)
-        else:
+        else: # p2p_communication.py 410 行
             input_tensors.append(p2p_communication.recv_forward(tensor_shape, config))
     return input_tensors
 
@@ -1229,7 +1229,7 @@ def send_forward(output_tensors, tensor_shapes, config):
     for output_tensor, tensor_shape in zip(output_tensors, tensor_shapes):
         if tensor_shape is None:
             continue
-        p2p_communication.send_forward(output_tensor, config)
+        p2p_communication.send_forward(output_tensor, config) # p2p_communication.py 457 行
 
 
 def send_backward(input_tensor_grads, tensor_shapes, config):
@@ -1240,16 +1240,16 @@ def send_backward(input_tensor_grads, tensor_shapes, config):
             continue
         p2p_communication.send_backward(input_tensor_grad, config)
 
-
+# 被 1467 行调用
 def send_forward_recv_backward(output_tensors, tensor_shapes, config):
     if not isinstance(output_tensors, list):
         output_tensors = [output_tensors]
-    output_tensor_grads = []
+    output_tensor_grads = [] # output_tensor_grads 是什么？是 dout 吗
     for output_tensor, tensor_shape in zip(output_tensors, tensor_shapes):
         if tensor_shape is None:
             output_tensor_grads.append(None)
             continue
-        output_tensor_grad = p2p_communication.send_forward_recv_backward(
+        output_tensor_grad = p2p_communication.send_forward_recv_backward( # p2p_communication.py 498 行
             output_tensor, tensor_shape, config
         )
         output_tensor_grads.append(output_tensor_grad)
@@ -1358,7 +1358,7 @@ def forward_backward_pipelining_without_interleaving(
     encoder_decoder_xattn = get_model_xattn(model)
 
     rank = parallel_state.get_pipeline_model_parallel_rank()
-    recv_tensor_shapes = get_tensor_shapes(
+    recv_tensor_shapes = get_tensor_shapes( # 调用 1161 行
         rank=rank - 1,
         model_type=model_type,
         seq_length=seq_length,
@@ -1382,12 +1382,12 @@ def forward_backward_pipelining_without_interleaving(
     output_tensors = None
     total_num_tokens = torch.tensor(0, dtype=torch.int).cuda()
 
-    if not forward_only:
+    if not forward_only: # 反向传播需要存储输入输出
         input_tensors = []
         output_tensors = []
     forward_data_store = []
 
-    # Run warmup forward passes.
+    # 运行 warmup 阶段的前向传播.
     for i in range(num_warmup_microbatches):
         # Decide to checkpoint all layers' activations of the current micro-batch
         if max_outstanding_backprops is not None:
@@ -1397,8 +1397,8 @@ def forward_backward_pipelining_without_interleaving(
             )
         else:
             checkpoint_activations_microbatch = None
-
-        input_tensor = recv_forward(recv_tensor_shapes, config)
+        # 从上一个 rank 接收输入张量
+        input_tensor = recv_forward(recv_tensor_shapes, config) # 调用 1206 行
         output_tensor, num_tokens = forward_step(
             forward_step_func,
             data_iterator,
@@ -1413,7 +1413,7 @@ def forward_backward_pipelining_without_interleaving(
             current_microbatch=i,
             encoder_decoder_xattn=encoder_decoder_xattn,
         )
-        send_forward(output_tensor, send_tensor_shapes, config)
+        send_forward(output_tensor, send_tensor_shapes, config) # 把张量发送给下一个 rank
         total_num_tokens += num_tokens.item()
 
         if not forward_only:
@@ -1421,13 +1421,13 @@ def forward_backward_pipelining_without_interleaving(
             output_tensors.append(output_tensor)
             deallocate_output_tensor(output_tensor[0], config.deallocate_pipeline_outputs)
 
-    # Before running 1F1B, need to receive first forward tensor.
-    # If all microbatches are run in warmup / cooldown phase, then no need to
-    # receive this tensor here.
+    # 在运行 1F1B 之前, 需要接收第一个 forward tensor.
+    # 如果所有的 microbatch 都运行在 warmup / cooldown 阶段, 那就没有必要
+    # 在这里接收张量.
     if num_microbatches_remaining > 0:
         input_tensor = recv_forward(recv_tensor_shapes, config)
 
-    # Run 1F1B in steady state.
+    # 运行 1F1B in steady state.
     for i in range(num_microbatches_remaining):
         last_iteration = i == (num_microbatches_remaining - 1)
 
@@ -1457,14 +1457,14 @@ def forward_backward_pipelining_without_interleaving(
         )
         total_num_tokens += num_tokens.item()
 
-        if forward_only:
-            send_forward(output_tensor, send_tensor_shapes, config)
+        if forward_only: # 如果只做前向传播
+            send_forward(output_tensor, send_tensor_shapes, config) # 给下一个 rank 发送
 
-            if not last_iteration:
-                input_tensor = recv_forward(recv_tensor_shapes, config)
+            if not last_iteration: # 如果不是最后一个 iter
+                input_tensor = recv_forward(recv_tensor_shapes, config) # 从上一个 rank 接收
 
-        else:
-            output_tensor_grad = send_forward_recv_backward(
+        else: # 需要做反向传播的情况
+            output_tensor_grad = send_forward_recv_backward( # 调用 1244 行接收下一个 rank 的张量（关于输出的梯度）
                 output_tensor, send_tensor_shapes, config
             )
 
@@ -1488,9 +1488,9 @@ def forward_backward_pipelining_without_interleaving(
                 input_tensor, output_tensor, output_tensor_grad, model_type, config
             )
 
-            if last_iteration:
+            if last_iteration: # 最后一个 iter
                 input_tensor = None
-                send_backward(input_tensor_grad, recv_tensor_shapes, config)
+                send_backward(input_tensor_grad, recv_tensor_shapes, config) # 给前一个 rank 发
             else:
                 input_tensor = send_backward_recv_forward(
                     input_tensor_grad, recv_tensor_shapes, config

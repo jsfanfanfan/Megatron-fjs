@@ -298,12 +298,12 @@ if __name__ == "__main__":
     train_valid_test_dataloaders_provider.is_distributed = True
 
     pretrain(
-        train_valid_test_dataloaders_provider,
-        model_provider,
+        train_valid_test_dataloaders_provider, # 返回一个 EnergonDataloader
+        model_provider, # 返回一个 LLava model
         ModelType.encoder_and_decoder,
-        forward_step,
+        forward_step, # 前向一个 batch
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
-        extra_args_provider=add_multimodal_extra_args,
+        extra_args_provider=add_multimodal_extra_args, # multimodel_args.py
         process_non_loss_data_func=write_online_eval_to_tensorboard,
         get_embedding_ranks=llava_embedding_ranks,
         get_position_embedding_ranks=llava_position_embedding_ranks,
